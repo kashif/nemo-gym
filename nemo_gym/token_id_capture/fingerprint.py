@@ -282,7 +282,12 @@ def _canonical_json(value: Any) -> str:
     try:
         return orjson.dumps(value, option=orjson.OPT_SORT_KEYS).decode("utf-8")
     except (TypeError, orjson.JSONEncodeError) as error:
-        raise ValueError(f"unsupported prompt content: {type(value).__name__}") from error
+        # orjson rejects integers wider than 64 bits, which a model can write into a tool
+        # argument; the stdlib encoder takes them and gives the same compact sorted form.
+        try:
+            return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        except (TypeError, ValueError):
+            raise ValueError(f"unsupported prompt content: {type(value).__name__}") from error
 
 
 def _update_field(hasher: Any, tag: bytes, value: str) -> None:
