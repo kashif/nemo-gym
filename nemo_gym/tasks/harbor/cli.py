@@ -11,12 +11,17 @@ Preparation writes, under ``results/harbor/<taskset>/``:
 
 Then the ordinary end-to-end rollout collection runs with that config plus the
 selected agent, environment server and model configs.
+
+``gym eval prepare <folder | harbor:dataset>`` runs the preparation alone (fetch, image
+configuration records, builds, rows), for once ahead of a fan-out of runs that then find
+the records complete and contact no registry.
 """
 
 import argparse
 import fnmatch
 import json
 import logging
+import shlex
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
@@ -163,11 +168,14 @@ def prepare_target(
     # the selected tasks' images are recorded, so an image a left-out task uses cannot stop it. A target
     # that is itself a task folder always loads (discover_tasks raises for it); selection applies after.
     # A missing or unreadable target is reported by discover_tasks below, in its own words.
+    resolved_now: list[str] = []
     images = (
-        record_base_images(folder, select=None if is_task_folder(folder) else selected) if folder.is_dir() else None
+        record_base_images(folder, select=None if is_task_folder(folder) else selected, resolved_now=resolved_now)
+        if folder.is_dir()
+        else None
     )
     if images is not None:
-        print(f"Base image configurations recorded in {images}")
+        print(f"Base image configurations recorded in {images} ({_resolved_note(resolved_now)})")
     unbuilt: dict[str, str] = {}
     if folder.is_dir():
         unbuilt = _build_dockerfiles(folder, build, select=None if is_task_folder(folder) else selected)
@@ -204,7 +212,8 @@ def prepare_target(
         raise _no_runnable_task(folder, errors)
     # A Compose file that does not resolve leaves its task out the same way; the others' images are still recorded.
     unresolved: dict[str, str] = {}
-    images = record_compose_images(tasks, tasks[0].path.parent, skipped=unresolved)
+    resolved_now = []
+    images = record_compose_images(tasks, tasks[0].path.parent, skipped=unresolved, resolved_now=resolved_now)
     if unresolved:
         for task_id, reason in unresolved.items():
             errors[task_id] = HarborTaskError(reason)
@@ -214,7 +223,7 @@ def prepare_target(
         if not tasks:
             raise _no_runnable_task(folder, errors)
     if images is not None:
-        print(f"Compose image configurations recorded in {images}")
+        print(f"Compose image configurations recorded in {images} ({_resolved_note(resolved_now)})")
     # The Compose adapter's field check, per task and before any sandbox exists: a field it does not start is
     # a skipped task with the field named, as an unloadable task is, not a seed failure of every episode.
     refused = {task.task_id: error for task in tasks if (error := unsupported_compose_fields_error(task))}
@@ -247,6 +256,43 @@ def prepare_target(
         skipped={task_id: str(error) for task_id, error in errors.items()},
         images=distinct,
     )
+
+
+def _resolved_note(resolved_now: list[str]) -> str:
+    """How much of an image record this preparation had to ask the registry for."""
+    if not resolved_now:
+        return "all reused, no registry request"
+    return f"{len(resolved_now)} resolved from the registry now, the rest reused"
+
+
+@exit_cleanly_on_config_error
+def prepare_only(args: argparse.Namespace, overrides: list[str]) -> None:
+    """Entry point for ``gym eval prepare <target> ...``: the preparation of a run, without the run.
+
+    Fetches a ``harbor:`` reference, records the image configurations, builds what needs building,
+    writes the rows and the image list, and stops: no servers are started and no rollout runs. Run it
+    once before a fan-out of ``gym eval run`` jobs on the same target, so the jobs find complete records
+    next to the task folders and contact no registry (the Docker Hub anonymous limit is per IP, shared by
+    every job on a login node). The preparation resumes where an earlier one stopped, so a rate-limited
+    or killed run is simply started again.
+    """
+    try:
+        prepared = prepare_target(
+            args.target,
+            exclude=_patterns(args, "exclude_tasks"),
+            only=_patterns(args, "only_tasks"),
+            build=build_options_from_overrides(overrides),
+        )
+    except (HarborTaskError, HubError, BuildError, ImageConfigError, ConfigError, ValueError, OSError) as exc:
+        args._parser.error(str(exc))
+    skipped = (
+        f"; {len(prepared.skipped)} task(s) skipped, see {prepared.output_dir / 'skipped.json'}"
+        if prepared.skipped
+        else ""
+    )
+    print(f"Prepared {prepared.taskset}: {len(prepared.tasks)} task(s) in {prepared.rows_path}{skipped}")
+    quoted = shlex.quote(args.target)
+    print(f"Next: gym eval run {quoted} --agent <harness> ...  (the records are complete; no registry request)")
 
 
 def run_images(tasks: list[HarborTask], image_configs: Mapping[str, Any]) -> tuple[str, ...]:
