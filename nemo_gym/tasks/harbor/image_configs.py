@@ -240,12 +240,18 @@ def dockerfile_base_images(folder: Path, *, select: Callable[[str], bool] | None
     return images
 
 
+def _is_current(entry: Any) -> bool:
+    """Whether a recorded entry carries everything the current loader reads (see ``RECORD_VERSION``)."""
+    return isinstance(entry, dict) and entry.get("record_version") == RECORD_VERSION
+
+
 def record_image_configs(
     references: dict[str, list[str]],
     folder: Path,
     *,
     client: RegistryClient | None = None,
     what: str = "image",
+    resolved_now: list[str] | None = None,
 ) -> Path | None:
     """Record the configuration of ``references`` (image reference to the tasks using it) into ``folder``.
 
@@ -255,40 +261,55 @@ def record_image_configs(
     reads) is read again, at the digest it was pinned to rather than the tag, so the pin does
     not move either. Returns the file's path, or ``None`` when there is nothing to record. A
     reference the registry cannot resolve raises :class:`ImageConfigError` naming the image,
-    the tasks and the registry's answer.
+    the tasks and the registry's answer. With ``resolved_now`` given, every reference this
+    call resolved and wrote is appended to it, so a caller can say how much was new.
 
-    The registry is asked outside the file's sidecar lock (:func:`record_lock`), so a slow
-    registry never holds up another process; the file is then read again, merged and replaced
-    under the lock, and an entry another process recorded in the meantime is kept over the
-    one resolved here, as a pinned entry always is (a legacy entry is replaced by its re-read).
+    Each image is written as soon as the registry answers for it, not once every image has:
+    the file is read again, merged and replaced atomically under its sidecar lock
+    (:func:`record_lock`) per image. A preparation that dies after N images leaves N records
+    on disk and the next one resolves only the rest; several preparations on one folder (the
+    Slurm jobs of a fan-out, or ``gym eval run`` and ``gym dataset validate`` of one ``harbor:``
+    ref) share their progress through the file rather than racing: before each lookup the
+    file is read again and an image another process recorded in the meantime is skipped, and
+    under the lock the first recording of a reference is the one kept, as a pinned entry
+    always is (a legacy entry is replaced by its re-read). The registry is asked outside the
+    lock, so a slow registry never holds up another process.
     """
     if not references:
         return None
     folder = Path(folder)
     path = folder / IMAGE_CONFIGS_FILE
     recorded = read_image_configs(folder)
-    missing = [ref for ref in references if (recorded.get(ref) or {}).get("record_version") != RECORD_VERSION]
+    missing = [ref for ref in references if not _is_current(recorded.get(ref))]
     if not missing:
         return path
     if client is None:
         client = RegistryClient()
     LOGGER.info(f"Recording the configuration of {len(missing)} {what}(s) into {path}")
-    resolved: dict[str, Any] = {}
-    for reference in missing:
-        pinned = (recorded.get(reference) or {}).get("image")
+    for index, reference in enumerate(missing, 1):
+        # Another preparation on this folder may have recorded it since the file was read (the replace is
+        # atomic, so the file is read without the lock); its entry is kept, and no registry request is made.
+        current = read_image_configs(folder).get(reference)
+        if _is_current(current):
+            LOGGER.info(f"{what} {reference} was recorded by another process meanwhile ({index}/{len(missing)})")
+            continue
+        pinned = ((current if isinstance(current, dict) else None) or recorded.get(reference) or {}).get("image")
         try:
-            resolved[reference] = client.image_config(pinned or reference)
+            record = client.image_config(pinned or reference)
         except ImageConfigError as exc:
             tasks = ", ".join(references[reference][:5]) or "-"
             raise ImageConfigError(
                 f"Could not record the configuration of {what} {reference!r} (used by task(s) {tasks}): {exc}"
             ) from exc
-    with record_lock(path):
-        recorded = read_image_configs(folder)
-        for reference, record in resolved.items():
-            if (recorded.get(reference) or {}).get("record_version") != RECORD_VERSION:
-                recorded[reference] = record
-        write_json_record(path, recorded)
+        with record_lock(path):
+            merged = read_image_configs(folder)
+            if _is_current(merged.get(reference)):
+                continue
+            merged[reference] = record
+            write_json_record(path, merged)
+        if resolved_now is not None:
+            resolved_now.append(reference)
+        LOGGER.info(f"Recorded {what} {reference} ({index}/{len(missing)})")
     return path
 
 
@@ -298,6 +319,7 @@ def record_compose_images(
     *,
     client: RegistryClient | None = None,
     skipped: dict[str, str] | None = None,
+    resolved_now: list[str] | None = None,
 ) -> Path | None:
     """Write ``compose-images.json`` in ``folder`` for the Compose tasks among ``tasks``.
 
@@ -305,7 +327,8 @@ def record_compose_images(
     resolve (an :class:`ImageConfigError` from :func:`load_compose_document`) does not stop the others:
     with ``skipped`` given it is recorded there by task id with the reason and left out, otherwise one
     :class:`ImageConfigError` at the end names every such task. An image the registry cannot resolve
-    still raises for the whole set, as :func:`record_image_configs` says.
+    still raises for the whole set, as :func:`record_image_configs` says; the images recorded before it
+    stay on disk, and ``resolved_now`` collects what this call resolved.
     """
     references: dict[str, list[str]] = {}
     failures: dict[str, str] = {}
@@ -321,20 +344,29 @@ def record_compose_images(
         raise ImageConfigError(f"{len(failures)} Compose task(s) do not resolve: " + "; ".join(failures.values()))
     if failures:
         skipped.update(failures)
-    return record_image_configs(references, folder, client=client, what="Compose image")
+    return record_image_configs(references, folder, client=client, what="Compose image", resolved_now=resolved_now)
 
 
 def record_base_images(
-    folder: Path, *, client: RegistryClient | None = None, select: Callable[[str], bool] | None = None
+    folder: Path,
+    *,
+    client: RegistryClient | None = None,
+    select: Callable[[str], bool] | None = None,
+    resolved_now: list[str] | None = None,
 ) -> Path | None:
     """Record the base image of every Dockerfile under ``folder`` next to the task folders, before they load.
 
     ``select`` limits the scan to the tasks whose folder name it accepts (see
     :func:`dockerfile_base_images`). Returns the file's path, or ``None`` when no task has a
-    Dockerfile the loader resolves.
+    Dockerfile the loader resolves. ``resolved_now`` collects the references this call resolved
+    (see :func:`record_image_configs`).
     """
     folder = Path(folder).resolve()
     parent = folder.parent if is_task_folder(folder) else folder
     return record_image_configs(
-        dockerfile_base_images(folder, select=select), parent, client=client, what="base image"
+        dockerfile_base_images(folder, select=select),
+        parent,
+        client=client,
+        what="base image",
+        resolved_now=resolved_now,
     )
